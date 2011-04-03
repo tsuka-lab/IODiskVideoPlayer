@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mx:UIComponent xmlns:mx="http://www.adobe.com/2006/mxml"
+	width="320"
+	height="240">
+	<mx:Script>
+		<![CDATA[
+			private var _autoPlay:Boolean = true;
+			private var _video:Video;
+			private var _source:String;
+			private var connection:NetConnection;
+			private var stream:NetStream;
+			
+			public function get autoPlay():Boolean {
+				return _autoPlay;
+			}
+			
+			public function set autoPlay(value:Boolean):void {
+				_autoPlay = value;
+			}
+			
+			public function get source():String {
+				return _source;
+			}
+			public function set source(src:String):void {
+				var orig:String = _source;
+				_source = src;
+				if (autoPlay && orig != source) {
+					play();
+				}
+			}
+			
+			public function get video():Video {
+				return _video;
+			}
+			
+			public function play():void {
+				// close connection
+				if (stream) {
+					stream.close();
+				}
+				if (connection) {
+					connection.close();
+				}
+				
+				connection = new NetConnection();
+				connection.addEventListener(
+					NetStatusEvent.NET_STATUS,
+					onNetStatus,
+					false, 0, true);
+				connection.addEventListener(
+					SecurityErrorEvent.SECURITY_ERROR,
+					onSecurityError,
+					false, 0, true);
+				connection.connect(null);
+			}
+			
+			public function pause():void {
+				
+			}
+			public function stop():void {
+				
+			}
+			
+			private function onNetStatus(event:NetStatusEvent):void {
+				switch (event.info.code) {
+					// NetConnection Status
+					case "NetConnection.Connect.Success":
+						updateVideo();
+						break;
+					
+					// NetStream Status
+				}
+			}
+			
+			private function onSecurityError(event:SecurityErrorEvent):void {
+				dispatchEvent(event);
+			}
+			
+			private function updateVideo():void {
+				stream = new NetStream(connection);
+				stream.addEventListener(
+					NetStatusEvent.NET_STATUS,
+					onNetStatus,
+					false, 0, true);
+				
+				removeVideo();
+				_video = new Video(width, height);
+				_video.attachNetStream(stream);
+				videoContainer.addChild(_video);
+			}
+			
+			private function removeVideo():void {
+				if (_video) {
+					videoContainer.removeChild(_video);
+					_video = null;
+				}
+			}
+		]]>
+	</mx:Script>
+	<mx:UIComponent
+		id="videoContainer"
+		/>
+</mx:UIComponent>

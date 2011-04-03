@@ -1,0 +1,940 @@
+<?xml version="1.0" encoding="utf-8"?>
+<mx:WindowedApplication xmlns:mx="http://www.adobe.com/2006/mxml"
+	layout="absolute"
+	width="600"
+	height="600"
+	backgroundColor="#000000"
+	applicationComplete="onApplicationComplete()"
+	frameRate="60"
+	showStatusBar="false"
+	xmlns:custom="custom.*"
+	mouseMove="onMouseMove()"
+	windowResize="onResize()"
+	
+	verticalScrollPolicy="off"
+	horizontalScrollPolicy="off"
+	>
+	<mx:Script>
+		<![CDATA[
+			import mx.controls.VideoDisplay;
+			import caurina.transitions.Tweener;
+			import mx.effects.Fade;
+			import mx.effects.Tween;
+			import mx.controls.CheckBox;
+			import mx.charts.CategoryAxis;
+			import mx.events.MetadataEvent;
+			import flash.utils.clearTimeout;
+			import mx.events.VideoEvent;
+			import mx.events.FlexEvent;
+			import mx.events.ListEvent;
+			import mx.utils.StringUtil;
+			import flash.utils.setTimeout;
+			import mx.controls.Alert;
+			import flash.filesystem.*;
+			
+			private var server:Socket;
+			private var sharedObj:SharedObject;
+			private var maxLogLength:int = 1000;
+			private var reverseIntervalSec:Number = 0.5; // should be higher than 0.5 sec
+			private var forwardIntervalSec:Number = 0.5; // should be higher than 0.5 sec
+			private var reversing:Boolean = false;
+			private var forwarding:Boolean = false;
+			[Bindable]
+			private var videoArray:Array = [];
+
+			private function onApplicationComplete():void {
+				sharedObj = SharedObject.getLocal("iodisk-video-player");
+				if (sharedObj.data.host) {
+					hostTextInput.text = sharedObj.data.host;
+				}
+				if (sharedObj.data.port) {
+					portTextInput.text = sharedObj.data.port;
+				}
+				if (sharedObj.data.maxLogLength) {
+					maxLogLength = sharedObj.data.maxLogLength;
+				}
+				maxLogLengthTextInput.text = maxLogLength.toString();
+				if (sharedObj.data.playlist) {
+					for each (var url:String in sharedObj.data.playlist) {
+						try {
+							var f:File = new File(url);
+							if (f.exists) {
+								videoArray.push(f);
+							}
+						} catch(err:Error) {}
+					}
+					if (videoArray.length > 0) {
+						videoList.invalidateList();
+						removeVideoButton.enabled = true;
+					}
+				}
+				onResize();
+				
+				videoDisplay.smoothing = true;
+				mouseMoveTimeoutId = setTimeout(onMouseStop, 5000);
+				
+				drawRotary(convDegreeToRadian(0));
+				
+				stage.addEventListener(KeyboardEvent.KEY_UP, onKeyboardEvent);
+			}
+			
+			private function onKeyboardEvent(keyEvent:KeyboardEvent):void {
+				switch (keyEvent.keyCode) {
+					case Keyboard.ENTER:
+						//this.connectButton
+						onConnectButtonClick();
+						break;
+					case Keyboard.N:
+						onCommand("next");
+						break;
+					case Keyboard.P:
+						onCommand("previous");
+						break;
+					
+					case Keyboard.F:
+						onCommand("forward");
+						break;
+					case Keyboard.R:
+						onCommand("reverse");
+						break;
+					
+					case Keyboard.S:
+						onCommand("stop");
+						break;
+					case Keyboard.SPACE:
+						onCommand("pause");
+						break;
+						
+					case Keyboard.NUMBER_1:
+						keyEvent.shiftKey
+							? onCommand("fr1")
+							: onCommand("ff1");
+						break;
+					case Keyboard.NUMBER_2:
+						keyEvent.shiftKey
+							? onCommand("fr2")
+							: onCommand("ff2");
+						break;
+					case Keyboard.NUMBER_3:
+						keyEvent.shiftKey
+							? onCommand("fr3")
+							: onCommand("ff3");
+						break;
+					case Keyboard.NUMBER_4:
+						keyEvent.shiftKey
+							? onCommand("fr4")
+							: onCommand("ff4");
+						break;
+					
+				}
+			}
+			
+			//
+			// Socket
+			//
+			private function onConnectButtonClick():void {
+				if (server && server.connected) {
+					server.close();
+					setButtonsConnectable();
+					return;
+				}
+				connectButton.enabled = false;
+				maxLogLengthTextInput.enabled = false;
+				hostTextInput.enabled = false;
+				portTextInput.enabled = false;
+				
+				var host:String = hostTextInput.text;
+				var port:int = parseInt(portTextInput.text);
+				// update and save maxLogLength
+				var i:int = parseInt(maxLogLengthTextInput.text);
+				if (!isNaN(i) && i > 0) {
+					maxLogLength = i;
+					sharedObj.data.maxLogLength = i;
+				}
+				// connect to server
+				server = new Socket();
+				server.addEventListener(ProgressEvent.SOCKET_DATA, onSocketData);
+				server.addEventListener(Event.CONNECT, function():void{
+					log("socket: connected");
+					connectButton.label = "Disconnect";
+					connectButton.enabled = true;
+				});
+				server.addEventListener(Event.CLOSE, onSocketError);
+				server.addEventListener(IOErrorEvent.IO_ERROR, onSocketError);
+				server.addEventListener(SecurityErrorEvent.SECURITY_ERROR, onSocketError);
+				log("socket: connecting...");
+				server.connect(host, port);
+				// save host and port
+				sharedObj.data.host = host;
+				sharedObj.data.port = port;
+			}
+			
+			private function onSocketError(event:Event):void {
+				log("socket: "+event.type);
+				setButtonsConnectable();
+			}
+			
+			private function setButtonsConnectable():void {
+				connectButton.label = "Connect";
+				connectButton.enabled = true;
+				maxLogLengthTextInput.enabled = true;
+				hostTextInput.enabled = true;
+				portTextInput.enabled = true;
+			}
+			
+			private function onSocketData(event:ProgressEvent):void {
+				var data:String = Socket(event.target).readUTFBytes(event.bytesLoaded);
+				for each (var str:String in data.split(/\r\n|\n|\r/)) {
+					if (str.length > 0) {
+						var n:Number = parseInt(str);
+						if (isNaN(n)) {
+							var cmd:String = StringUtil.trim(str);
+							log("[Command] " + cmd);
+							onCommand(cmd);
+						} else {
+							//log("[Number] " + str);
+							drawRotary(convDegreeToRadian(n));
+						}
+					}
+				}
+			}
+			
+			private function onCommand(cmd:String):void {
+				// not reverse or fr1~4
+				if (reversing
+					&& !(/^(reverse|fr\d|s\-)/).test(cmd))
+				{
+					log("cancel reversing");
+					clearTimeout(reverseTimeoutId);
+					reversing = false;
+				}
+				
+				// not ff1~4
+				if (forwarding
+					&& !(/^(ff\d|s\+)/).test(cmd))
+				{
+					log("cancel fast forwarding");
+					clearTimeout(forwardTimeoutId);
+					forwarding = false;
+				}
+				
+				switch(cmd) {
+					case "forward":
+						playSelectedVideo();
+						speedIndicator.forward1();
+						break;
+					case "next":
+						playNextVideo();
+						break;
+					case "previous":
+						playPreviousVideo();
+						break;
+					case "pause":
+						pauseVideo();
+						speedIndicator.pause();
+						break;
+					case "stop":
+						stopVideo();
+						break;
+					
+					case "ff1":
+						forwardVideo(0.5);
+						speedIndicator.forward2();
+						break;
+					case "ff2":
+						forwardVideo(1);
+						speedIndicator.forward3();
+						break;
+					case "ff3":
+						forwardVideo(1.5);
+						speedIndicator.forward4();
+						break;
+					case "ff4":
+						forwardVideo(2);
+						speedIndicator.forward4();
+						break;
+					
+					case "reverse":
+						reverseVideo(2);
+						speedIndicator.reverse1();
+						break;
+					case "fr1":
+						reverseVideo(3);
+						speedIndicator.reverse2();
+						break;
+					case "fr2":
+						reverseVideo(4);
+						speedIndicator.reverse3();
+						break;
+					case "fr3":
+						reverseVideo(5);
+						speedIndicator.reverse4();
+						break;
+					case "fr4":
+						reverseVideo(6);
+						speedIndicator.reverse4();
+						break;
+				}
+				// s+
+				var mPlus:Array = cmd.match(/^s\+([\d\.]+)/);
+				if (mPlus) {
+					var n:Number = parseFloat(mPlus[1]);
+					forwardVideo(n);
+					speedIndicator.fastForward(n/2);
+					return;
+				}
+				
+				// s-
+				var mMinus:Array = cmd.match(/^s-([\d\.]+)/);
+				if (mMinus) {
+					var m:Number = parseFloat(mMinus[1]);
+					reverseVideo(m);
+					speedIndicator.reverse(n/2);
+					return;
+				}
+			}
+			
+			//
+			// Control Video
+			//
+			private var jumping:Boolean = false;
+			private function playNextVideo():void {
+				if (videoArray.length == 0) return; // No video in list
+				if (jumping) return;
+				jumping = true;
+				clearTimeout(reverseTimeoutId);
+				clearTimeout(forwardTimeoutId);
+				reversing = false;
+				forwarding = false;
+				
+				var nextIndex:int = videoList.selectedIndex + 1;
+				if (nextIndex > videoArray.length-1) {
+					nextIndex = 0;
+				}
+				videoList.selectedIndex = nextIndex;
+				speedIndicator.clear();
+				
+				var self:WindowedApplication = this;
+				Tweener.removeTweens(videoDisplay);
+				Tweener.addTween(videoDisplay, {
+					x: -self.width,
+					y: -self.height/7,
+					alpha: 0,
+					time: 0.7,
+					transition: "easeInQuint",
+					onComplete: function():void {
+						// after move out
+						videoDisplay.x = self.width;
+						videoDisplay.close();
+						playSelectedVideo();
+						//videoDisplay.pause();
+						Tweener.addTween(videoDisplay, {
+							x: 0,
+							y: 0,
+							alpha: 1,
+							time: 0.7,
+							transition: "easeOutQuint",
+							onComplete: function():void {
+								//videoDisplay.play();
+								speedIndicator.forward1();
+								jumping = false;
+							}
+						});
+					}
+				});
+			}
+			
+			private function playPreviousVideo():void {
+				if (videoArray.length == 0) return; // No video in list
+				if (jumping) return;
+				jumping = true;
+				clearTimeout(reverseTimeoutId);
+				clearTimeout(forwardTimeoutId);
+				reversing = false;
+				forwarding = false;
+				
+				var prevIndex:int = videoList.selectedIndex - 1;
+				if (prevIndex < 0) {
+					prevIndex = videoArray.length-1;
+				}
+				videoList.selectedIndex = prevIndex;
+				speedIndicator.clear();
+				
+				var self:WindowedApplication = this;
+				Tweener.removeTweens(videoDisplay);
+				Tweener.addTween(videoDisplay, {
+					x: self.width,
+					y: -self.height/7,
+					alpha: 0,
+					time: 0.7,
+					transition: "easeInQuint",
+					onComplete: function():void {
+						// after move out
+						videoDisplay.x = -self.width;
+						videoDisplay.close();
+						playSelectedVideo();
+						//videoDisplay.pause();
+						Tweener.addTween(videoDisplay, {
+							x: 0,
+							y: 0,
+							alpha: 1,
+							delay: 0.2,
+							time: 0.7,
+							transition: "easeOutQuint",
+							onComplete: function():void {
+								//videoDisplay.play();
+								speedIndicator.forward1();
+								jumping = false;
+							}
+						});
+					}
+				});
+			}
+			
+			private function playSelectedVideo():void {
+				if (videoArray.length == 0) {
+					log("No video in the PlayList");
+					return;
+				}
+				if (videoList.selectedIndex < 0) {
+					videoList.selectedIndex = 0;
+				}
+				var file:File = File(videoList.selectedItem);
+				if (videoDisplay.source != file.url) {
+					videoDisplay.source = file.url;
+					videoSlider.value = 0;
+					videoDisplay.totalTime = -1;
+					videoSlider.enabled = false;
+				}
+				log("play: "+file.nativePath);
+				videoDisplay.play();
+			}
+			
+			private function stopVideo():void {
+				if (isVideoReady()) {
+					log("stop video");
+					videoDisplay.playheadTime = 0;
+					videoDisplay.stop();
+					speedIndicator.stop();
+				}
+			}
+			
+			private function pauseVideo():void {
+				if (isVideoReady()) {
+					videoDisplay.pause();
+					//speedIndicator.pause();
+				}
+			}
+			
+			//
+			// fast forward
+			//
+			private function forwardVideo(intervalSec:Number = 0.5):void {
+				if (!isVideoReady()) return;
+				if (jumping) return;
+				forwardIntervalSec = intervalSec;
+				if (forwarding) {
+					log("already fast forwarding");
+					return;
+				}
+				/*
+				if (!videoDisplay.stateResponsive) {
+					log("video stateResponsive: false");
+					log("cancel fast forwarding");
+					return;
+				}
+				*/
+				pauseVideo();
+				forwarding = true;
+				countSameForwardTime = 0;
+				_forwardVideo();
+			}
+			
+			private var forwardTimeoutId:int;
+			private var prevForwardTime:Number = 0;
+			private var countSameForwardTime:uint = 0;
+			
+			private function _forwardVideo():void {
+				if (!forwarding) {
+					log("stop fast forwarding");
+					return;
+				}
+				
+				if (countSameForwardTime > 3) {
+					log("forward: probably end of video");
+					forwarding = false;
+					videoDisplay.close(); // force close
+					playNextVideo();
+					return;
+				}
+				
+				var newSec:Number = videoDisplay.playheadTime + forwardIntervalSec;
+				if (newSec == prevForwardTime) {
+					countSameForwardTime += 1;
+				}
+				log("forward: " + newSec + " (+" + forwardIntervalSec + ")");
+				prevForwardTime = newSec;
+				videoDisplay.playheadTime = newSec;
+				forwardTimeoutId = setTimeout(_forwardVideo, 300); // should be higher than 300 msec
+			}
+			
+			//
+			// reverse
+			//
+			private var tid:int;
+			private function reverseVideo(intervalSec:Number = 1):void {
+				if (!isVideoReady()) return;
+				if (jumping) return;
+				reverseIntervalSec = intervalSec;
+				log("intervalSec: "+intervalSec);
+				if (reversing) {
+					log("already reversing");
+					return;
+				}
+				clearTimeout(tid);
+				reversing = true;
+				pauseVideo();
+				/*
+				if (!videoDisplay.stateResponsive) {
+					log("video stateResponsive: false");
+					log("cancel reverse");
+					return;
+				}
+				*/
+				countSameReverseTime = 0;
+				var tid:int = setTimeout(_reverseVideo,
+											videoDisplay.stateResponsive
+												? 100
+												: 1500);
+			}
+			
+			private var reverseTimeoutId:int;
+			private var countSameReverseTime:uint = 0;
+			private var prevReverseTime:Number = 0;
+			
+			private function _reverseVideo():void {
+				if (!reversing) {
+					log("stop reversing");
+					return;
+				}
+				
+				if (countSameReverseTime > 3) {
+					log("reverse: error");
+					reversing = false;
+					speedIndicator.pause();
+					return;
+				}
+				if (!videoDisplay.stateResponsive) {
+					log("video: can not move playhead !");
+					reverseIntervalSec += 1;
+					countSameReverseTime += 1;
+					log("reverse speed increse to "+reverseIntervalSec);
+					setTimeout(_reverseVideo, 1000);
+					return;
+				}
+				/*
+				if (countSameReverseTime > 2) {
+					log("reverse: too slow!");
+					reversing = false;
+					speedIndicator.pause();
+					log("video state:" + videoDisplay.state);
+					log("video Responseive:" + videoDisplay.stateResponsive);
+					return;
+				}
+				*/
+				
+				var newSec:Number = videoDisplay.playheadTime - reverseIntervalSec;
+				if (newSec < 0) {
+					videoDisplay.playheadTime = 0;
+					speedIndicator.pause();
+					reversing = false;
+					log("reverse: start point");
+					return;
+				}
+				if (newSec == prevReverseTime) {
+					countSameReverseTime += 1;
+				}
+				log("r: " + newSec + " (-" + reverseIntervalSec + ")");
+				videoDisplay.playheadTime = newSec;
+				prevReverseTime = newSec;
+				reverseTimeoutId = setTimeout(_reverseVideo, 900); // should be higher than 300 msec
+			}
+			
+			private function isVideoReady():Boolean {
+				return (videoDisplay.bytesTotal > 0
+						&& videoDisplay.bytesLoaded == videoDisplay.bytesTotal);
+			}
+			
+			//
+			// Video Events
+			//
+			private function onVideoComplete(event:VideoEvent):void {
+				log("video: complete");
+				log("  totalTime: "+videoDisplay.totalTime);
+				log("  playhead: "+ videoDisplay.playheadTime);
+				
+				// cache totalTime
+				var totalTime:Number = -1;
+				if (videoDisplay.totalTime
+					&& videoDisplay.totalTime > 0) {
+					totalTime = videoDisplay.totalTime;
+				} else if (videoDisplay.playheadTime
+							&& videoDisplay.playheadTime > 0) {
+					totalTime = videoDisplay.playheadTime;
+				}
+				if (totalTime > 0) {
+					if (!sharedObj.data.totalTimeCache) {
+						sharedObj.data.totalTimeCache = {};
+					}
+					sharedObj.data.totalTimeCache[videoDisplay.source] = totalTime;
+					log("  cache totalTime: " + sharedObj.data.totalTimeCache[videoDisplay.source]);
+				}
+				playNextVideo();
+			}
+			
+			private function onVideoEvent(event:Event):void {
+				log("video event: " + event.type);
+			}
+			
+			private function onMetadataReceived(event:MetadataEvent):void {
+				if (videoDisplay.metadata
+					&& videoDisplay.metadata.duration)
+				{
+					//log("metadata.duration: " + videoDisplay.metadata.duration + " sec");
+				}
+			}
+			
+			private function onVideoReady(event:VideoEvent):void {
+				log("video: ready");
+				// set totalTime manually
+				
+				if (videoDisplay.metadata
+					&& videoDisplay.metadata.duration) {
+					videoDisplay.totalTime = videoDisplay.metadata.duration;
+					log("  metadata.duration: " + videoDisplay.totalTime + " sec");
+				} else if (sharedObj.data.totalTimeCache
+							&& sharedObj.data.totalTimeCache[videoDisplay.source]) {
+					videoDisplay.totalTime = sharedObj.data.totalTimeCache[videoDisplay.source];
+					log("  cached totalTime: " + videoDisplay.totalTime + " sec");
+				}
+				log("  totalTime: "+videoDisplay.totalTime+" sec");
+				videoSlider.enabled = (videoDisplay.totalTime
+										&& videoDisplay.totalTime > 0);
+			}
+			
+			
+			private function onPlayheadUpdate(event:VideoEvent):void {
+				if (!videoDisplay.totalTime || videoDisplay.totalTime <= 0) return;
+				var v:Number = videoDisplay.playheadTime / videoDisplay.totalTime;
+				//log(v.toString());
+				videoSlider.value = v;
+			}
+			
+			private function onVideoSliderChange(event:Event):void {
+				
+			}
+			
+			//
+			// Log
+			//
+			private function log(str:String):void {
+				if (logTextArea.text.length > maxLogLength) {
+					logTextArea.text = "";
+				}
+				if (logTextArea.text) {
+					str = "\n" + str;
+				}
+				logTextArea.text += str +" ";
+				setTimeout(onLogChange, 60);
+			}
+			private function onLogChange():void {
+				logTextArea.verticalScrollPosition = logTextArea.textHeight / 12;
+			}
+			private function onShowLogCheckBoxChange(event:Event):void {
+				//logContainer.visible = CheckBox(event.target).selected;
+			}
+			
+			//
+			// VideoList
+			//
+			private function onAddVideoButtonClick():void {
+				var dir:File = File.desktopDirectory;
+				dir.addEventListener(FileListEvent.SELECT_MULTIPLE, function(event:FileListEvent):void {
+					for each (var file:File in event.files) {
+						log("add: "+file.nativePath);
+						videoArray.push(file);
+					}
+					videoList.invalidateList();
+					if (videoArray.length > 0) {
+						removeVideoButton.enabled = true;
+					}
+					cachePlaylist();
+				});
+				dir.browseForOpenMultiple(
+					"Select FLV Files",
+					[new FileFilter("FLV", "*.flv")]);
+			}
+			
+			private function onRemoveVideoButtonClick():void {
+				if (videoList.selectedIndex < 0) return;
+				videoArray.splice(videoList.selectedIndex, 1);
+				videoList.invalidateList();
+				if (videoArray.length == 0) {
+					removeVideoButton.enabled = false;
+				}
+				cachePlaylist();
+			}
+			private function cachePlaylist():void {
+				sharedObj.data.playlist = videoArray.map(function(file:File, index:int, array:Array):String {
+					return file.url;
+				});
+			}
+			private function getVideoListItemLabel(item:Object):String {
+				return File(item).name;
+			}
+			
+			//
+			// Mouse
+			//
+			private var mouseMoveTimeoutId:int;
+			private function onMouseMove():void {
+				//playlistPanel.visible = true;
+				connectPanel.visible = true;
+				clearTimeout(mouseMoveTimeoutId);
+				mouseMoveTimeoutId = setTimeout(onMouseStop, 3000);
+			}
+			private function onMouseStop():void {
+				//playlistPanel.visible = false;
+				connectPanel.visible = false;
+			}
+			
+			private function onResize():void {
+				if (width && height) {
+					videoDisplay.width = videoContainer.width;
+					videoDisplay.height = videoContainer.height;
+				}
+			}
+			
+			//
+			// rotary
+			//
+			private function drawRotary(radian:Number):void {
+				/*
+				var cx:int = rotary.width/2;
+				var cy:int = rotary.height/2;
+				*/
+				var r:int = 23;
+				radian = -radian;
+				radian -= convDegreeToRadian(90);
+				
+				with(rotary.graphics) {
+					clear();
+					lineStyle(7, 0xFFFFFF, 0.5);
+					moveTo(0, 0);
+					lineTo(
+						r * Math.cos(radian),
+						r * Math.sin(radian));
+					drawCircle(0, 0, r);
+				}
+			}
+			private function convDegreeToRadian(a:Number):Number {
+				return a * Math.PI / 180;
+			}
+		]]>
+	</mx:Script>
+	<mx:Style>
+		TextInput
+		{
+			font-size: 11;
+			vertical-align: middle;
+		}
+		
+		List
+		{
+			font-size: 11;
+			border-color: #FFFFFF;
+		}
+		
+		CheckBox,
+		Label
+		{
+			font-weight: bold;
+			font-size: 13;
+			vertical-align: middle;
+		}
+		
+		.panel
+		{
+			background-color: #CCCCCC;
+			background-alpha: 0.9;
+			border-color: #EEEEEE;
+			border-style: solid;
+			padding-left: 8;
+			padding-right: 8;
+			padding-top: 8;
+			padding-bottom: 8;
+			corner-radius: 5;
+			drop-shadow-enabled: true;
+		}
+	</mx:Style>
+	
+	<mx:Fade id="fadeOut" duration="700" alphaFrom="0.9" alphaTo="0" />
+	<mx:Fade id="fadeIn"  duration="500" alphaFrom="0" alphaTo="0.9" />
+	
+	<mx:Canvas
+		id="sliderContainer"
+		top="0"
+		width="100%"
+		height="40"
+		backgroundColor="#EEEEEE"
+		borderColor="#999999"
+		borderStyle="solid"
+		borderSides="bottom"
+		>
+		<mx:HSlider
+			id="videoSlider"
+			left="12"
+			right="12"
+			top="8"
+			maximum="1"
+			enabled="false"
+			change="onVideoSliderChange(event)"
+			/>
+	</mx:Canvas>
+	
+	<mx:Canvas
+		id="videoContainer"
+		width="100%"
+		height="100%"
+		top="40"
+		backgroundColor="#000000"
+		verticalScrollPolicy="off"
+		horizontalScrollPolicy="off"
+		>
+		<custom:SmoothVideoDisplay
+			id="videoDisplay"
+			x="0"
+			y="0"
+			width="400"
+			height="300"
+			autoPlay="false"
+			autoRewind="false"
+			complete="onVideoComplete(event)"
+			ready="onVideoReady(event)"
+			metadataReceived="onMetadataReceived(event)"
+			playheadUpdate="onPlayheadUpdate(event)"
+			borderColor="#000000"
+			borderStyle="solid"
+			/>
+		<mx:Canvas
+			id="rotary"
+			right="40"
+			top="40"
+			width="1"
+			height="1"
+			/>
+		<custom:SpeedIndicator
+			id="speedIndicator"
+			right="40"
+			top="40"
+			width="1"
+			height="1"
+			/>
+	</mx:Canvas>
+	
+	<mx:HBox
+		id="connectPanel"
+		styleName="panel"
+		bottom="8"
+		left="8"
+		right="8"
+		showEffect="{fadeIn}"
+		hideEffect="{fadeOut}"
+		>
+		<mx:Label text="Host" />
+		<mx:TextInput
+			id="hostTextInput"
+			text="localhost"
+			width="140" />
+		<mx:Label text="Port" />
+		<mx:TextInput
+			id="portTextInput"
+			text="4323"
+			restrict="0-9"
+			width="60" />
+		<mx:Button id="connectButton" label="Connect" click="onConnectButtonClick()" />
+		<mx:CheckBox
+			id="showLogCheckBox"
+			label="Log"
+			selected="false"
+			/>
+		<mx:CheckBox
+			id="showPlaylistCheckBox"
+			label="Playlist"
+			selected="false"
+			/>
+	</mx:HBox>
+	
+	
+	<mx:VBox
+		id="playlistPanel"
+		right="8"
+		bottom="60"
+		styleName="panel"
+		showEffect="{fadeIn}"
+		hideEffect="{fadeOut}"
+		visible="{showPlaylistCheckBox.selected}"
+		>
+		<mx:List
+			id="videoList"
+			dataProvider="{videoArray}"
+			width="140"
+			height="200"
+			labelFunction="getVideoListItemLabel"
+			change="playSelectedVideo()"
+			/>
+		<mx:HBox>
+			<mx:Button
+				id="addVideoButton"
+				label="Add"
+				click="onAddVideoButtonClick()"
+				/>
+			<mx:Button
+				id="removeVideoButton"
+				label="Remove"
+				click="onRemoveVideoButtonClick()"
+				enabled="false"
+				/>
+		</mx:HBox>
+	</mx:VBox>
+	
+	
+	<mx:VBox
+		id="logContainer"
+		styleName="panel"
+		visible="{showLogCheckBox.selected}"
+		left="8"
+		bottom="60"
+		showEffect="{fadeIn}"
+		hideEffect="{fadeOut}"
+		>
+		<mx:TextArea
+			id="logTextArea"
+			text=""
+			width="400"
+			height="200"
+			fontSize="12"
+			/>
+		<mx:HBox>
+			<mx:Label text="Clear when the log is over" />
+			<mx:TextInput
+				id="maxLogLengthTextInput"
+				text=""
+				restrict="0-9"
+				width="50"
+				/>
+			<mx:Label text="characters." />
+		</mx:HBox>
+	</mx:VBox>
+
+</mx:WindowedApplication>
